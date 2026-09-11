@@ -1,0 +1,212 @@
+// This is the Prisma schema for Velozity Dashboard
+// Database: PostgreSQL
+// ORM: Prisma 5.x
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────
+
+enum Role {
+  ADMIN
+  PROJECT_MANAGER
+  DEVELOPER
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  IN_REVIEW
+  DONE
+  OVERDUE
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum ProjectStatus {
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  ARCHIVED
+}
+
+// ─────────────────────────────────────────────
+// Models
+// ─────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String
+  role         Role     @default(DEVELOPER)
+  isOnline     Boolean  @default(false) @map("is_online")
+  lastSeen     DateTime? @map("last_seen")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  refreshTokens     RefreshToken[]
+  managedProjects   Project[]         @relation("ProjectManager")
+  projectMemberships ProjectMember[]
+  assignedTasks     Task[]            @relation("TaskAssignee")
+  createdTasks      Task[]            @relation("TaskCreator")
+  activityLogs      ActivityLog[]
+  notifications     Notification[]
+  createdClients    Client[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  tokenHash String   @unique @map("token_hash")
+  expiresAt DateTime @map("expires_at")
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Index for fast token lookup on every auth request
+  @@index([tokenHash])
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model Client {
+  id        String   @id @default(uuid())
+  name      String
+  email     String   @unique
+  company   String
+  phone     String?
+  createdBy String   @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  creator  User      @relation(fields: [createdBy], references: [id])
+  projects Project[]
+
+  @@map("clients")
+}
+
+model Project {
+  id          String        @id @default(uuid())
+  name        String
+  description String?
+  clientId    String        @map("client_id")
+  createdBy   String        @map("created_by")
+  status      ProjectStatus @default(ACTIVE)
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  client       Client          @relation(fields: [clientId], references: [id])
+  manager      User            @relation("ProjectManager", fields: [createdBy], references: [id])
+  members      ProjectMember[]
+  tasks        Task[]
+  activityLogs ActivityLog[]
+
+  // Index for PM's project list queries
+  @@index([createdBy])
+  @@index([clientId])
+  @@map("projects")
+}
+
+model ProjectMember {
+  projectId String @map("project_id")
+  userId    String @map("user_id")
+  addedAt   DateTime @default(now()) @map("added_at")
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, userId])
+  @@map("project_members")
+}
+
+model Task {
+  id           String     @id @default(uuid())
+  title        String
+  description  String?
+  projectId    String     @map("project_id")
+  assignedTo   String?    @map("assigned_to")
+  createdBy    String     @map("created_by")
+  status       TaskStatus @default(TODO)
+  priority     Priority   @default(MEDIUM)
+  dueDate      DateTime?  @map("due_date")
+  isOverdue    Boolean    @default(false) @map("is_overdue")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+
+  project      Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  assignee     User?         @relation("TaskAssignee", fields: [assignedTo], references: [id])
+  creator      User          @relation("TaskCreator", fields: [createdBy], references: [id])
+  activityLogs ActivityLog[]
+  notifications Notification[]
+
+  // Indexes explained:
+  // projectId  — every task list is scoped to a project; this is the most frequent join
+  // assignedTo — developers query "my tasks" constantly; without this, full table scan
+  // (dueDate, isOverdue) — composite for the cron job that flags overdue; also powers date-range filter
+  @@index([projectId])
+  @@index([assignedTo])
+  @@index([dueDate, isOverdue])
+  @@index([status])
+  @@map("tasks")
+}
+
+model ActivityLog {
+  id         String     @id @default(uuid())
+  taskId     String     @map("task_id")
+  projectId  String     @map("project_id")
+  userId     String     @map("user_id")
+  action     String     // e.g. "moved", "assigned", "created", "commented"
+  fromStatus TaskStatus? @map("from_status")
+  toStatus   TaskStatus? @map("to_status")
+  metadata   Json?      // Extra data (e.g. assigned user name)
+  createdAt  DateTime   @default(now()) @map("created_at")
+
+  task    Task    @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id])
+
+  // Indexes explained:
+  // (projectId, createdAt DESC) — PM/Admin feed queries; most recent first within a project
+  // (userId, createdAt DESC)    — Developer's personal feed; "activity on my tasks"
+  // taskId                      — task detail page shows per-task history
+  @@index([projectId, createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([taskId])
+  @@map("activity_logs")
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  title     String
+  message   String
+  read      Boolean  @default(false)
+  taskId    String?  @map("task_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task Task? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  // Index: unread count badge query on every page load
+  @@index([userId, read])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("notifications")
+}
